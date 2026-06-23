@@ -1,0 +1,17 @@
+# Build output
+/target/
+
+# Local warden runtime state (policy, manifests, audit log)
+.warden/
+*.log
+audit.jsonl
+
+# OS / editor
+.DS_Store
+*.swp
+__pycache__/
+*.pyc
+
+# Hi-res logo master -- rendered assets/logo.png + assets/icon.png ship; the
+# large source master stays out of the public repo.
+/assets/logo-source.png

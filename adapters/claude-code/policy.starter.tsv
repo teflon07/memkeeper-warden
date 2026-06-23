@@ -1,0 +1,20 @@
+# Warden starter policy — INERT BY DEFAULT.
+#
+# Warden is deny-by-default: with no grants for a principal, every request from
+# it is denied. This starter intentionally grants NOTHING to your agent
+# ("claude-code-main"), so flipping to enforce never silently authorizes a broad
+# surface. Add your own project roots below, deliberately, before enforcing.
+#
+# Format (tab-separated):  <principal>\t<class>\t<scope>\t<allow|deny>
+# Classes: fs:read   fs:write   exec   net
+#
+# Example — grant your agent read+write to ONE project (uncomment and edit; use a
+# real absolute path and the narrowest root that works). Prefer several specific
+# roots over one broad one like your whole home directory:
+# claude-code-main	fs:read	/Users/you/projects/myapp	allow
+# claude-code-main	fs:write	/Users/you/projects/myapp	allow
+
+# Required by the bundled end-to-end self-test. Harmless: grants read only to the
+# self-test fixture directory the installer seeds under ~/.warden. The $HOME token
+# is expanded at load time. Leave this in place.
+warden-selftest	fs:read	$HOME/.warden/fixtures/allowed	allow
