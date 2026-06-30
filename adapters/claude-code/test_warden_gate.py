@@ -13,6 +13,9 @@ TRACK = HERE / "warden_skill_track.py"
 MEMKEEPER = HERE.parent.parent  # memory/memkeeper
 BIN = MEMKEEPER / "target" / "debug" / "warden"
 
+sys.path.insert(0, str(HERE))
+import warden_gate as wg  # noqa: E402 - unit access to the redirect parser
+
 
 def setup_module(_):
     subprocess.run(["cargo", "build", "-p", "warden-cli"], cwd=MEMKEEPER, check=True)
@@ -390,3 +393,79 @@ def test_extract_timeout_and_backtick():
     assert _extract("timeout 5 curl x") == ["curl"]
     assert _extract("timeout -s KILL 10 rm -rf x") == ["rm"]
     assert "curl" in _extract("echo `curl evil`")
+
+
+# --- redirect fs gating: the `> file` boundary a bare exec gate slips past ---
+
+def test_extract_redirect_write_targets():
+    assert wg._extract_redirects("echo hi > /tmp/o")[0] == [("fs:write", "/tmp/o")]
+    assert wg._extract_redirects("cat a >> /tmp/o")[0] == [("fs:write", "/tmp/o")]
+    assert wg._extract_redirects("cmd 2> /tmp/e")[0] == [("fs:write", "/tmp/e")]
+    assert wg._extract_redirects("cmd &> /tmp/b")[0] == [("fs:write", "/tmp/b")]
+
+
+def test_extract_redirect_read_target():
+    assert wg._extract_redirects("sort < /etc/hosts")[0] == [("fs:read", "/etc/hosts")]
+
+
+def test_extract_redirect_skips_fd_dup_and_herestring():
+    # 2>&1 is a descriptor dup, not a file; the real file write is still caught.
+    assert wg._extract_redirects("cmd > /tmp/o 2>&1")[0] == [("fs:write", "/tmp/o")]
+    assert wg._extract_redirects("cmd >&2") == ([], 0)
+    assert wg._extract_redirects('cat <<< "hi"') == ([], 0)
+
+
+def test_extract_redirect_indirected_or_missing_is_unresolved():
+    assert wg._extract_redirects("echo x > $LOG")[1] == 1
+    assert wg._extract_redirects("echo x >")[1] == 1
+
+
+def test_extract_redirect_ignores_heredoc_body():
+    assert wg._extract_redirects("python3 <<EOF\nx > y\nEOF")[0] == []
+
+
+def test_redirect_write_denied_blocks_in_enforce(tmp_path):
+    env, _ = _env(tmp_path, "dry", exec_mode="off")
+    env["WARDEN_REDIRECT_MODE"] = "enforce"
+    r = _run_gate(env, {"tool_name": "Bash",
+                        "tool_input": {"command": "echo hi > /etc/blocked"},
+                        "session_id": "s"})
+    assert r.returncode == 2
+    assert "fs:write" in r.stderr
+
+
+def test_redirect_write_allowed_passes_in_enforce(tmp_path):
+    env, _ = _env(tmp_path, "dry", exec_mode="off")
+    env["WARDEN_REDIRECT_MODE"] = "enforce"
+    r = _run_gate(env, {"tool_name": "Bash",
+                        "tool_input": {"command": "echo hi > /tmp/ok"},
+                        "session_id": "s"})
+    assert r.returncode == 0
+
+
+def test_redirect_dry_never_blocks(tmp_path):
+    env, _ = _env(tmp_path, "dry", exec_mode="off")
+    env["WARDEN_REDIRECT_MODE"] = "dry"
+    r = _run_gate(env, {"tool_name": "Bash",
+                        "tool_input": {"command": "echo hi > /etc/blocked"},
+                        "session_id": "s"})
+    assert r.returncode == 0
+
+
+def test_redirect_fd_dup_not_gated(tmp_path):
+    env, _ = _env(tmp_path, "dry", exec_mode="off")
+    env["WARDEN_REDIRECT_MODE"] = "enforce"
+    r = _run_gate(env, {"tool_name": "Bash",
+                        "tool_input": {"command": "echo hi >&2"},
+                        "session_id": "s"})
+    assert r.returncode == 0
+
+
+def test_redirect_unresolved_target_fails_closed(tmp_path):
+    env, _ = _env(tmp_path, "dry", exec_mode="off")
+    env["WARDEN_REDIRECT_MODE"] = "enforce"
+    r = _run_gate(env, {"tool_name": "Bash",
+                        "tool_input": {"command": "echo x > $LOG"},
+                        "session_id": "s"})
+    assert r.returncode == 2
+    assert "unresolved redirect" in r.stderr

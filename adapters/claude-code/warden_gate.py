@@ -29,6 +29,13 @@ MODE = (os.environ.get("WARDEN_GATE_MODE") or "dry").lower()
 # Exec gating ramps independently of fs. Default dry: audit every program but
 # never block, so the allowlist can be built from real usage before flipping.
 EXEC_MODE = (os.environ.get("WARDEN_EXEC_MODE") or "dry").lower()
+# Redirect (fs-via-shell) gating ramps independently too. A program can be
+# exec-allowed yet still write a denied path via `cmd > /protected` -- the exec
+# gate sees `cmd`, never the file. This closes that fs:write hole. Default dry so
+# the fs:write/read allowlist for redirect targets is built from real usage
+# before flipping to enforce (WARDEN_GATE_MODE governs the Write/Edit tools; this
+# governs the same boundary reached through a shell redirection).
+REDIRECT_MODE = (os.environ.get("WARDEN_REDIRECT_MODE") or "dry").lower()
 SOCK = os.environ.get("WARDEN_SOCK", "/tmp/warden_daemon.sock")
 BIN = os.environ.get(
     "WARDEN_BIN",
@@ -185,6 +192,20 @@ _OPERATOR_ONLY = re.compile(r"^[0-9]*[<>|&;()]+[0-9&]*$")
 # What a real program basename may look like once normalized to basename.
 _VALID_PROG = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._+-]*$")
 
+# Redirection operators whose NEXT token is a FILE we must gate. Write forms
+# (`>`, `>>`, `>|`, `N>`, `&>`, `&>>`) -> fs:write; read form (`<`, `N<`) ->
+# fs:read. Deliberately NOT matched: fd-dups (`>&`, `N>&M`, `<&` -- target is a
+# descriptor, not a file), here-strings (`<<<`), and heredocs (`<<`, already
+# stripped). The `&` in the write form is only the leading "both streams" form;
+# a trailing `&` (`>&`) fails the anchor and is treated as a dup.
+_REDIR_WRITE = re.compile(r"^[0-9]*&?>>?\|?$")
+_REDIR_READ = re.compile(r"^[0-9]*<$")
+
+# A `<<< word` here-string reads from a string, not a file. Stripped before
+# redirect extraction so it isn't misread as a `<` input redirect (and so it
+# dodges _strip_heredocs, which otherwise treats `<<< "x"` as a heredoc).
+_HERESTRING_RE = re.compile(r"<<<\s*('[^']*'|\"[^\"]*\"|\S+)")
+
 # `<<` / `<<-` heredoc opener with a quoted or bare delimiter word.
 _HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
@@ -332,84 +353,182 @@ def _extract_programs(command: str) -> tuple[list[str], int]:
     return programs, unresolved
 
 
-def _handle_bash(tool_input: dict, principal: str) -> int:
-    """Gate a Bash call by asking the broker for an `exec <program>` decision per
-    invoked program. Governed by WARDEN_EXEC_MODE: off → pass through; dry →
-    audit only, never block; enforce → block (exit 2) if any program is denied or
-    the broker is unreachable. Any internal error fails closed only under enforce."""
+def _extract_redirects(command: str) -> tuple[list[tuple[str, str]], int]:
+    """File targets of shell redirections as (capability, raw_target) pairs:
+    `> f`/`>> f`/`&> f` -> ('fs:write', f); `< f` -> ('fs:read', f). Skips
+    fd-dups (`>&2`, `2>&1`), here-strings (`<<<`), and heredocs (stripped). The
+    second value counts write/read redirects whose target is missing or
+    indirected ($VAR, brace/backtick) and so cannot be resolved to a concrete
+    path -- the caller fails closed on those under enforce, mirroring the exec
+    path's unresolved handling. Same tokenizer as _extract_programs so heredocs,
+    backticks and quoting are handled identically."""
+    tokens = _tokenize(_normalize_backticks(_strip_heredocs(_HERESTRING_RE.sub(" ", command))))
+    out: list[tuple[str, str]] = []
+    unresolved = 0
+    i, n = 0, len(tokens)
+    while i < n:
+        tok = tokens[i]
+        cap = "fs:write" if _REDIR_WRITE.match(tok) else (
+            "fs:read" if _REDIR_READ.match(tok) else None
+        )
+        if cap is None:
+            i += 1
+            continue
+        tgt = tokens[i + 1] if i + 1 < n else None
+        i += 2
+        if tgt is None or tgt in _SEPARATORS or _OPERATOR_ONLY.match(tgt):
+            unresolved += 1  # malformed redirect: no concrete file target
+        elif tgt.startswith("&"):
+            continue  # `>& 2` style fd-dup target, not a file
+        elif "$" in tgt or "`" in tgt or "{" in tgt:
+            unresolved += 1  # $-indirected / brace / subshell path -> fail closed
+        else:
+            out.append((cap, tgt))
+    return out, unresolved
+
+
+def _gate_exec(command: str, principal: str) -> bool:
+    """Ask the broker for an `exec <program>` decision per invoked program.
+    Governed by WARDEN_EXEC_MODE: off → pass; dry → audit only; enforce → block.
+    Returns True if the call must be blocked (enforce + a denied / unreachable /
+    unparseable program)."""
+    if EXEC_MODE == "off":
+        return False
+    programs, unresolved = _extract_programs(command)
+    if unresolved:
+        # A non-empty segment we could not reduce to a program ($-indirected,
+        # backtick/brace junk). Recorded in every mode so the gap is visible;
+        # under enforce it fails closed below.
+        _log({"principal": principal, "capability": "exec", "target": "",
+              "mode": EXEC_MODE, "event": "exec_unresolved",
+              "unresolved": unresolved, "command": command[:200]})
+    if not programs and not unresolved:
+        # Legitimately no external program: pure builtin (`export`, `:`) or a
+        # parse shape that reduced cleanly to nothing. Audit and allow.
+        _log({"principal": principal, "capability": "exec", "target": "",
+              "mode": EXEC_MODE, "event": "exec_no_program",
+              "command": command[:200]})
+        return False
+
+    denied: list[tuple[str, str]] = []
+    unreachable: list[str] = []
+    for prog in programs:
+        resp = decide(principal, "exec", prog)
+        base = {"principal": principal, "capability": "exec",
+                "target": prog, "mode": EXEC_MODE}
+        if resp is None:
+            # Carry the raw command on the blocking records (deny/unreachable)
+            # so an audit can reconstruct intent — the program token alone
+            # loses context (e.g. `check` from a subcommand, a launchd label,
+            # a typo'd path). Allows stay lean and omit it.
+            _log({**base, "event": "broker_unreachable", "command": command[:200]})
+            unreachable.append(prog)
+            continue
+        decision = resp.get("decision")
+        reason = resp.get("reason", "")
+        entry = {**base, "event": "decision", "decision": decision, "reason": reason}
+        if decision == "deny":
+            entry["command"] = command[:200]
+            denied.append((prog, reason))
+        _log(entry)
+
+    if EXEC_MODE != "enforce":
+        return False  # dry: audit only, never block
+
+    if unresolved:
+        # We could not identify the program(s) this command runs, so we never
+        # got a broker decision. Fail closed, mirroring broker-unreachable —
+        # "couldn't decide" must not silently mean "allow" under enforce.
+        print(f"warden: unparseable command segment, failing closed for '{principal}'",
+              file=sys.stderr)
+        _notify(f"unparseable exec ({principal})")
+        return True
+    if unreachable:
+        names = ", ".join(unreachable)
+        print(f"warden: broker unreachable, failing closed for exec {names}",
+              file=sys.stderr)
+        _notify(f"broker unreachable: exec {unreachable[0]}")
+        return True
+    if denied:
+        names = ", ".join(p for p, _ in denied)
+        print(f"warden: blocked exec {names} for '{principal}'", file=sys.stderr)
+        _notify(f"exec {names} ({principal})")
+        return True
+    return False
+
+
+def _gate_redirects(command: str, principal: str, cwd: str | None) -> bool:
+    """Gate the FILE targets of shell redirections as fs:write / fs:read,
+    governed by WARDEN_REDIRECT_MODE. This is the same boundary the Write/Edit/
+    Read tools cross, reached through a shell redirection instead: `cmd > file`
+    is an fs:write to `file` even when `cmd` is exec-allowed. Returns True if the
+    call must be blocked (enforce + a denied / unreachable / unresolved target)."""
+    if REDIRECT_MODE == "off":
+        return False
+    redirects, unresolved = _extract_redirects(command)
+    if unresolved:
+        _log({"principal": principal, "capability": "fs", "target": "",
+              "mode": REDIRECT_MODE, "via": "redirect", "event": "redirect_unresolved",
+              "unresolved": unresolved, "command": command[:200]})
+    denied: list[str] = []
+    unreachable: list[str] = []
+    for cap, raw in redirects:
+        target = _abs(os.path.expanduser(raw), cwd)
+        resp = decide(principal, cap, target)
+        base = {"principal": principal, "capability": cap, "target": target,
+                "mode": REDIRECT_MODE, "via": "redirect"}
+        if resp is None:
+            _log({**base, "event": "broker_unreachable", "command": command[:200]})
+            unreachable.append(f"{cap} {target}")
+            continue
+        decision = resp.get("decision")
+        reason = resp.get("reason", "")
+        entry = {**base, "event": "decision", "decision": decision, "reason": reason}
+        if decision == "deny":
+            entry["command"] = command[:200]
+            denied.append(f"{cap} {target}")
+        _log(entry)
+
+    if REDIRECT_MODE != "enforce":
+        return False  # dry: audit only, never block
+
+    if unresolved:
+        print(f"warden: unresolved redirect target, failing closed for '{principal}'",
+              file=sys.stderr)
+        _notify(f"unresolved redirect ({principal})")
+        return True
+    if unreachable:
+        print(f"warden: broker unreachable, failing closed for {unreachable[0]}",
+              file=sys.stderr)
+        _notify(f"broker unreachable: {unreachable[0]}")
+        return True
+    if denied:
+        print(f"warden: blocked {', '.join(denied)} for '{principal}'", file=sys.stderr)
+        _notify(f"{denied[0]} ({principal})")
+        return True
+    return False
+
+
+def _handle_bash(tool_input: dict, principal: str, cwd: str | None = None) -> int:
+    """Gate a Bash call on two independent boundaries: the programs it execs
+    (WARDEN_EXEC_MODE) and the files it writes/reads via shell redirection
+    (WARDEN_REDIRECT_MODE — the fs:write boundary a bare `> file` would otherwise
+    slip past). Either boundary blocks (exit 2) under its own enforce; internal
+    errors fail closed only if either boundary is enforcing."""
     try:
-        if EXEC_MODE == "off":
+        if EXEC_MODE == "off" and REDIRECT_MODE == "off":
             return 0
         command = tool_input.get("command")
         if not command or not isinstance(command, str):
             return 0
-
-        programs, unresolved = _extract_programs(command)
-        if unresolved:
-            # A non-empty segment we could not reduce to a program ($-indirected,
-            # backtick/brace junk). Recorded in every mode so the gap is visible;
-            # under enforce it fails closed below.
-            _log({"principal": principal, "capability": "exec", "target": "",
-                  "mode": EXEC_MODE, "event": "exec_unresolved",
-                  "unresolved": unresolved, "command": command[:200]})
-        if not programs and not unresolved:
-            # Legitimately no external program: pure builtin (`export`, `:`) or a
-            # parse shape that reduced cleanly to nothing. Audit and allow.
-            _log({"principal": principal, "capability": "exec", "target": "",
-                  "mode": EXEC_MODE, "event": "exec_no_program",
-                  "command": command[:200]})
-            return 0
-
-        denied: list[tuple[str, str]] = []
-        unreachable: list[str] = []
-        for prog in programs:
-            resp = decide(principal, "exec", prog)
-            base = {"principal": principal, "capability": "exec",
-                    "target": prog, "mode": EXEC_MODE}
-            if resp is None:
-                # Carry the raw command on the blocking records (deny/unreachable)
-                # so an audit can reconstruct intent — the program token alone
-                # loses context (e.g. `check` from a subcommand, a launchd label,
-                # a typo'd path). Allows stay lean and omit it.
-                _log({**base, "event": "broker_unreachable", "command": command[:200]})
-                unreachable.append(prog)
-                continue
-            decision = resp.get("decision")
-            reason = resp.get("reason", "")
-            entry = {**base, "event": "decision", "decision": decision, "reason": reason}
-            if decision == "deny":
-                entry["command"] = command[:200]
-                denied.append((prog, reason))
-            _log(entry)
-
-        if EXEC_MODE != "enforce":
-            return 0  # dry: audit only, never block
-
-        if unresolved:
-            # We could not identify the program(s) this command runs, so we never
-            # got a broker decision. Fail closed, mirroring broker-unreachable —
-            # "couldn't decide" must not silently mean "allow" under enforce.
-            print(f"warden: unparseable command segment, failing closed for '{principal}'",
-                  file=sys.stderr)
-            _notify(f"unparseable exec ({principal})")
-            return 2
-        if unreachable:
-            names = ", ".join(unreachable)
-            print(f"warden: broker unreachable, failing closed for exec {names}",
-                  file=sys.stderr)
-            _notify(f"broker unreachable: exec {unreachable[0]}")
-            return 2
-        if denied:
-            names = ", ".join(p for p, _ in denied)
-            print(f"warden: blocked exec {names} for '{principal}'", file=sys.stderr)
-            _notify(f"exec {names} ({principal})")
-            return 2
-        return 0
+        block = _gate_exec(command, principal)
+        block = _gate_redirects(command, principal, cwd) or block
+        return 2 if block else 0
     except Exception:
-        # Contain exec-path bugs to exec semantics: never brick Bash while exec
-        # is observing in dry, but honor fail-closed under enforce.
-        if EXEC_MODE == "enforce":
-            print("warden: unexpected exec gate error, failing closed", file=sys.stderr)
+        # Contain gate bugs to Bash semantics: never brick Bash while observing
+        # in dry, but honor fail-closed under either enforcing boundary.
+        if EXEC_MODE == "enforce" or REDIRECT_MODE == "enforce":
+            print("warden: unexpected gate error, failing closed", file=sys.stderr)
             return 2
         return 0
 
@@ -423,7 +542,7 @@ def main() -> int:
     tool_name = payload.get("tool_name")
     if tool_name == "Bash":
         principal = _principal(payload.get("session_id") or "unknown")
-        return _handle_bash(payload.get("tool_input") or {}, principal)
+        return _handle_bash(payload.get("tool_input") or {}, principal, payload.get("cwd"))
 
     mapping = TOOL_MAP.get(tool_name)
     if not mapping:
